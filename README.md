@@ -31,7 +31,7 @@ This crate treats your component graph as a mathematical object (a weighted undi
 | Metric | What It Tells You |
 |--------|------------------|
 | **Fiedler value** | Second-smallest eigenvalue. Higher = better connected. Zero = disconnected. |
-| **Cheeger constant** | Bottleneck measure, 0 to 1. Higher = fewer bottlenecks. |
+| **Cheeger bounds** | Upper and lower bounds on edge expansion from Cheeger's inequality. |
 | **Fragility index** | 1 / Fiedler value. Higher = more fragile. Infinity = disconnected. |
 | **Component importance** | How much removing each component hurts connectivity. |
 | **Bottleneck edges** | Edges whose removal most reduces connectivity. |
@@ -58,7 +58,8 @@ probe.connect("api", "db", 1.0);
 // Spectral analysis
 let eigenvalues = probe.spectrum();           // All Laplacian eigenvalues
 let fiedler = probe.fiedler_value();           // Connectivity measure
-let cheeger = probe.cheeger_constant();        // Bottleneck measure
+let cheeger_ub = probe.cheeger_upper_bound();  // h(G) ≤ √(2·λ₂)
+let cheeger_lb = probe.cheeger_lower_bound();  // λ₂/2 ≤ h(G)
 let fragile = probe.fragility_index();         // 1/fiedler (infinity if disconnected)
 
 // Health check
@@ -84,6 +85,15 @@ let avg_deg = probe.average_degree();          // Average weighted degree
 5. Component importance is computed by removing each node and measuring Fiedler drop
 
 Zero dependencies. Works on `no_std` targets with `alloc`.
+
+## Mathematical References
+
+The spectral methods used here are well-established in the literature:
+
+- **Fiedler, M.** (1973). *Algebraic connectivity of graphs.* Czechoslovak Mathematical Journal, 23(2), 298-305. — Introduced the Fiedler vector and algebraic connectivity.
+- **Chung, F.** (1997). *Spectral Graph Theory.* CBMS Regional Conference Series in Mathematics, No. 92, AMS. — Comprehensive reference for normalized and combinatorial Laplacians.
+- **Mohar, B.** (1989). *Isoperimetric numbers of graphs.* Journal of Combinatorial Theory, Series B, 47(3), 274-291. — Cheeger constants for graphs.
+- **Alon, N. & Milman, V.** (1985). *λ₁, isoperimetric inequalities for graphs, and superconcentrators.* Journal of Combinatorial Theory, Series B, 38(1), 73-88. — The Alon-Milman bound relating spectral gap to expansion.
 
 ## License
 

@@ -121,13 +121,46 @@ impl CathedralProbe {
         self.fiedler_value()
     }
 
-    /// Cheeger constant approximation (edge expansion).
-    /// 0 to 1. Higher = fewer bottlenecks.
-    pub fn cheeger_constant(&self) -> f64 {
+    /// Spectral conductance bound based on Cheeger's inequality.
+    ///
+    /// This is NOT the exact Cheeger constant h(G). Computing h(G) exactly
+    /// requires checking all partitions of the vertex set, which is NP-hard.
+    ///
+    /// Instead, this returns the upper bound from the Cheeger inequality:
+    ///   h(G) ≤ √(2·λ₂)
+    ///
+    /// where λ₂ is the Fiedler value (algebraic connectivity). A higher value
+    /// means fewer bottlenecks are possible. Use `cheeger_lower_bound()` for
+    /// the complementary lower bound: λ₂/2 ≤ h(G).
+    ///
+    /// References:
+    /// - Fiedler, M. (1973). "Algebraic connectivity of graphs."
+    ///   Czechoslovak Mathematical Journal, 23(2), 298-305.
+    /// - Chung, F. (1997). "Spectral Graph Theory." CBMS Regional Conference
+    ///   Series in Mathematics, No. 92. AMS.
+    /// - Mohar, B. (1989). "Isoperimetric numbers of graphs." Journal of
+    ///   Combinatorial Theory, Series B, 47(3), 274-291.
+    pub fn cheeger_upper_bound(&self) -> f64 {
         let fiedler = self.fiedler_value();
         if self.nodes.len() <= 1 { return 0.0; }
-        // Fiedler gives an upper bound on Cheeger: h <= sqrt(2 * lambda_2)
-        (fiedler / 2.0).sqrt().clamp(0.0, 1.0)
+        (2.0 * fiedler).sqrt()
+    }
+
+    /// Lower bound on the Cheeger constant from Cheeger's inequality.
+    ///
+    /// Returns λ₂/2, satisfying: λ₂/2 ≤ h(G) ≤ √(2·λ₂)
+    pub fn cheeger_lower_bound(&self) -> f64 {
+        self.fiedler_value() / 2.0
+    }
+
+    /// Legacy alias for `cheeger_upper_bound()`.
+    ///
+    /// **Note:** This previously returned √(λ₂/2), which is not a standard
+    /// Cheeger bound. The correct upper bound is √(2·λ₂). This method now
+    /// returns the correct value for backward compatibility.
+    #[deprecated(note = "Use cheeger_upper_bound() or cheeger_lower_bound() instead")]
+    pub fn cheeger_constant(&self) -> f64 {
+        self.cheeger_upper_bound()
     }
 
     /// Quick health check: is the Fiedler value above a minimum threshold?
@@ -308,11 +341,23 @@ mod tests {
     }
 
     #[test]
-    fn test_cheeger_constant() {
+    fn test_cheeger_bounds() {
         let mut p = CathedralProbe::new(vec!["a", "b"]);
         p.connect("a", "b", 1.0);
+        let ub = p.cheeger_upper_bound();
+        let lb = p.cheeger_lower_bound();
+        assert!(ub >= 0.0);
+        assert!(lb >= 0.0);
+        assert!(ub >= lb); // upper bound >= lower bound
+    }
+
+    #[test]
+    fn test_cheeger_legacy_alias() {
+        let mut p = CathedralProbe::new(vec!["a", "b"]);
+        p.connect("a", "b", 1.0);
+        #[allow(deprecated)]
         let c = p.cheeger_constant();
-        assert!(c >= 0.0 && c <= 1.0);
+        assert_eq!(c, p.cheeger_upper_bound());
     }
 
     #[test]
