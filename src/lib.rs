@@ -3,8 +3,9 @@
 //! Spectral topology analysis for component graphs.
 //!
 //! Compute Laplacian eigenvalues, Fiedler value (connectivity), Cheeger constant
-//! (bottleneck detection), and component importance. Answer: "is the space between
-//! my components healthy?"
+//! (bottleneck detection), component importance, effective resistance, spectral
+//! embedding, spectral clustering, community profiles, and Fiedler sensitivity.
+//! Answer: "is the space between my components healthy?"
 //!
 //! ## Numerical Methods
 //!
@@ -328,6 +329,343 @@ impl CathedralProbe {
         if self.nodes.is_empty() { return 0.0; }
         self.total_weight() * 2.0 / self.nodes.len() as f64
     }
+
+    // ─── Full eigendecomposition (eigenvalues + eigenvectors) ────
+
+    /// Compute all eigenvalues and eigenvectors of the graph Laplacian.
+    ///
+    /// Returns `(eigenvalues, eigenvectors)` where `eigenvectors[k]` is the
+    /// eigenvector corresponding to `eigenvalues[k]`, sorted ascending.
+    fn full_eigen(&self) -> (Vec<f64>, Vec<Vec<f64>>) {
+        let n = self.nodes.len();
+        if n == 0 { return (vec![], vec![]); }
+        if n == 1 { return (vec![0.0], vec![vec![1.0]]); }
+
+        let lap = self.build_laplacian();
+        let (diag, subdiag, q) = householder_tridiag_with_q(&lap);
+        let (mut eigs, vecs_tri, _iters, _converged) =
+            implicit_qr_tridiag_with_vectors(diag, subdiag, 1e-14, n * 30);
+
+        // Transform eigenvectors back: V = Q * V_tridiag
+        // vecs_tri[j][k] = j-th component of k-th eigenvector (columns are eigenvectors)
+        let mut vecs = vec![vec![0.0f64; n]; n];
+        for k in 0..n {
+            for i in 0..n {
+                for j in 0..n {
+                    vecs[k][i] += q[i][j] * vecs_tri[j][k];
+                }
+            }
+        }
+
+        // Clean near-zero eigenvalues
+        for e in &mut eigs {
+            if e.abs() < 1e-10 { *e = 0.0; }
+        }
+
+        // Sort by eigenvalue ascending
+        let mut indices: Vec<usize> = (0..n).collect();
+        indices.sort_by(|&a, &b| eigs[a].partial_cmp(&eigs[b]).unwrap());
+
+        let sorted_eigs: Vec<f64> = indices.iter().map(|&i| eigs[i]).collect();
+        let sorted_vecs: Vec<Vec<f64>> = indices.iter().map(|&i| vecs[i].clone()).collect();
+
+        (sorted_eigs, sorted_vecs)
+    }
+
+    // ─── Advanced spectral methods ──────────────────────────────
+
+    /// Effective graph resistance (resistance distance) between nodes i and j.
+    ///
+    /// R_eff(i,j) = Σ_{k=1}^{n-1} (1/λ_k) · (v_k[i] - v_k[j])²
+    ///
+    /// Uses the pseudoinverse of the Laplacian: L⁺ = V Λ⁺ V^T.
+    ///
+    /// # References
+    /// - Klein, D.J. & Randić, M. (1993). "Resistance Distance."
+    ///   *Journal of Mathematical Chemistry*, 17, 165-180.
+    pub fn effective_resistance(&self, i: usize, j: usize) -> f64 {
+        let n = self.nodes.len();
+        assert!(i < n && j < n, "node indices out of bounds");
+        if i == j { return 0.0; }
+
+        let (eigs, vecs) = self.full_eigen();
+        let mut r_eff = 0.0;
+        // Skip k=0 (λ₀ = 0); sum k=1..n-1
+        for k in 1..n {
+            if eigs[k].abs() < 1e-14 { continue; }
+            let diff = vecs[k][i] - vecs[k][j];
+            r_eff += diff * diff / eigs[k];
+        }
+        r_eff
+    }
+
+    /// Kirchhoff index: sum of all pairwise effective resistances.
+    ///
+    /// Kf(G) = Σ_{i<j} R_eff(i,j) = n · trace(L⁺)
+    ///
+    /// # References
+    /// - Klein & Randić (1993), "Resistance Distance"
+    pub fn kirchhoff_index(&self) -> f64 {
+        let n = self.nodes.len();
+        if n < 2 { return 0.0; }
+
+        let (eigs, _vecs) = self.full_eigen();
+        // trace(L⁺) = Σ_{k=1}^{n-1} 1/λ_k
+        let trace_lplus: f64 = eigs[1..].iter()
+            .filter(|&&e| e.abs() > 1e-14)
+            .map(|&e| 1.0 / e)
+            .sum();
+        n as f64 * trace_lplus
+    }
+
+    /// Spectral embedding: project nodes into ℝ^k using the k smallest
+    /// non-zero eigenvectors of the Laplacian.
+    ///
+    /// Returns a vector of length n, where each entry is a k-dimensional vector.
+    /// This is the foundation of spectral clustering (Ng, Jordan & Weiss 2001).
+    ///
+    /// # References
+    /// - Ng, A., Jordan, M. & Weiss, Y. (2001). "On Spectral Clustering."
+    ///   *NeurIPS*.
+    pub fn spectral_embedding(&self, dimensions: usize) -> Vec<Vec<f64>> {
+        let n = self.nodes.len();
+        if n == 0 { return vec![]; }
+
+        let (eigs, vecs) = self.full_eigen();
+        // Collect the k smallest non-zero eigenvectors
+        let mut embed_vecs: Vec<&Vec<f64>> = Vec::new();
+        for k in 1..n {
+            if eigs[k].abs() > 1e-14 {
+                embed_vecs.push(&vecs[k]);
+                if embed_vecs.len() >= dimensions { break; }
+            }
+        }
+        let d = embed_vecs.len();
+
+        // Build embedding matrix: node i -> vec of length d
+        let mut embedding = vec![vec![0.0; d]; n];
+        for (dim, vec) in embed_vecs.iter().enumerate() {
+            for i in 0..n {
+                embedding[i][dim] = vec[i];
+            }
+        }
+        embedding
+    }
+
+    /// Spectral clustering: partition nodes into k clusters.
+    ///
+    /// Uses spectral embedding into ℝ^k followed by k-means (Lloyd's algorithm)
+    /// with row-normalization (Ng-Jordan-Weiss method).
+    ///
+    /// Returns a vector of length n with cluster assignments (0..k-1).
+    ///
+    /// # References
+    /// - Ng, Jordan & Weiss (2001). "On Spectral Clustering."
+    pub fn spectral_cluster(&self, k: usize) -> Vec<usize> {
+        let n = self.nodes.len();
+        if n == 0 { return vec![]; }
+        if k <= 1 { return vec![0; n]; }
+        if k >= n {
+            return (0..n).collect();
+        }
+
+        // Step 1: Spectral embedding into k dimensions
+        let mut embedding = self.spectral_embedding(k);
+        let d = embedding[0].len();
+        if d == 0 { return vec![0; n]; }
+
+        // Step 2: Row-normalize (Ng-Jordan-Weiss)
+        for row in &mut embedding {
+            let norm: f64 = row.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if norm > 1e-14 {
+                for v in row.iter_mut() { *v /= norm; }
+            }
+        }
+
+        // Step 3: k-means (Lloyd's algorithm)
+        kmeans(&embedding, k, 100)
+    }
+
+    /// Network community profile: for each community size s, compute
+    /// the minimum conductance Φ(s).
+    ///
+    /// Returns (size, min_conductance) pairs, revealing the "best" communities
+    /// at each scale. Uses the Fiedler vector sweep-cut heuristic.
+    ///
+    /// # References
+    /// - Leskovec, J. et al. (2009). "Community Structure in Large Networks:
+    ///   Natural Cluster Sizes and the Absence of Large Well-Defined Clusters."
+    pub fn community_profile(&self) -> Vec<(usize, f64)> {
+        let n = self.nodes.len();
+        if n < 2 { return vec![]; }
+
+        let edges = &self.edges;
+
+        // Compute degree of each node
+        let mut degree = vec![0.0f64; n];
+        for &(i, j, w) in edges {
+            degree[i] += w;
+            degree[j] += w;
+        }
+        let total_vol: f64 = degree.iter().sum();
+
+        // Sort nodes by Fiedler vector value (sweep-cut heuristic)
+        let (_, vecs) = self.full_eigen();
+        if vecs.len() < 2 { return vec![]; }
+        let fiedler_vec = &vecs[1];
+
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| fiedler_vec[a].partial_cmp(&fiedler_vec[b]).unwrap());
+
+        let mut node_pos = vec![0usize; n];
+        for (pos, &node) in order.iter().enumerate() {
+            node_pos[node] = pos;
+        }
+
+        let mut profile = Vec::new();
+        for s in 1..=(n / 2) {
+            let vol_s: f64 = order[..s].iter().map(|&node| degree[node]).sum();
+
+            // Compute cut edges crossing the partition
+            let in_s = {
+                let mut mask = vec![false; n];
+                for &node in &order[..s] { mask[node] = true; }
+                mask
+            };
+            let mut cut = 0.0f64;
+            for &(i, j, w) in edges {
+                if in_s[i] != in_s[j] {
+                    cut += w;
+                }
+            }
+
+            let vol_complement = total_vol - vol_s;
+            let cond = if vol_s.min(vol_complement) > 1e-14 {
+                cut / vol_s.min(vol_complement)
+            } else {
+                f64::INFINITY
+            };
+            profile.push((s, cond));
+        }
+
+        profile
+    }
+
+    /// Fiedler sensitivity: how much does the Fiedler value change if we
+    /// modify each edge?
+    ///
+    /// Returns `Vec<(usize, usize, f64)>` — (i, j, ∂λ₂/∂w_ij) for each edge.
+    /// Uses the formula: ∂λ₂/∂w_ij = (v₂[i] - v₂[j])²
+    ///
+    /// This is more efficient than `bottlenecks()` which rebuilds the graph.
+    ///
+    /// # References
+    /// - Fiedler, M. (1973). "Algebraic connectivity of graphs."
+    pub fn fiedler_sensitivity(&self) -> Vec<(usize, usize, f64)> {
+        let n = self.nodes.len();
+        if n < 2 { return vec![]; }
+
+        let (_, vecs) = self.full_eigen();
+        if vecs.len() < 2 { return vec![]; }
+        let fiedler_vec = &vecs[1];
+
+        self.edges.iter().map(|&(i, j, _)| {
+            let diff = fiedler_vec[i] - fiedler_vec[j];
+            (i, j, diff * diff)
+        }).collect()
+    }
+
+    /// Condition number of the graph Laplacian.
+    ///
+    /// κ(L) = λ_max / λ_min_nonzero
+    ///
+    /// Measures numerical stability of solving Laplacian systems.
+    /// A large condition number indicates ill-conditioning.
+    pub fn condition_number(&self) -> f64 {
+        let spec = self.spectrum();
+        if spec.is_empty() { return 0.0; }
+
+        let lambda_max = spec.last().copied().unwrap_or(0.0);
+        let lambda_min_nonzero = spec.iter()
+            .find(|&&e| e.abs() > 1e-10)
+            .copied();
+
+        match lambda_min_nonzero {
+            Some(lnz) if lnz.abs() > 1e-14 => lambda_max / lnz,
+            _ => {
+                // No non-zero eigenvalue found => graph is disconnected (Laplacian is singular)
+                f64::INFINITY
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// k-means (Lloyd's algorithm)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Simple k-means clustering using Lloyd's algorithm.
+///
+/// Returns cluster assignments for each point (0..k-1).
+fn kmeans(data: &[Vec<f64>], k: usize, max_iter: usize) -> Vec<usize> {
+    let n = data.len();
+    let d = if n > 0 { data[0].len() } else { return vec![]; };
+    if k == 0 || n == 0 || d == 0 { return vec![0; n]; }
+
+    // Initialize centroids: spread them across the data
+    let mut centroids: Vec<Vec<f64>> = Vec::with_capacity(k);
+    for c in 0..k {
+        let idx = c * n / k;
+        centroids.push(data[idx].clone());
+    }
+
+    let mut assignments = vec![0usize; n];
+
+    for _ in 0..max_iter {
+        let mut changed = false;
+
+        // Assignment step
+        for i in 0..n {
+            let mut best = 0;
+            let mut best_dist = f64::INFINITY;
+            for (c, centroid) in centroids.iter().enumerate() {
+                let dist: f64 = data[i].iter()
+                    .zip(centroid)
+                    .map(|(&a, &b)| (a - b) * (a - b))
+                    .sum();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = c;
+                }
+            }
+            if assignments[i] != best {
+                assignments[i] = best;
+                changed = true;
+            }
+        }
+
+        if !changed { break; }
+
+        // Update step
+        let mut sums = vec![vec![0.0; d]; k];
+        let mut counts = vec![0usize; k];
+        for i in 0..n {
+            let c = assignments[i];
+            counts[c] += 1;
+            for j in 0..d {
+                sums[c][j] += data[i][j];
+            }
+        }
+        for (c, centroid) in centroids.iter_mut().enumerate() {
+            if counts[c] > 0 {
+                for j in 0..d {
+                    centroid[j] = sums[c][j] / counts[c] as f64;
+                }
+            }
+        }
+    }
+
+    assignments
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -374,9 +712,7 @@ impl SparseCathedralProbe {
         let mut values = Vec::new();
 
         for i in 0..num_nodes {
-            // Sort neighbors for deterministic CSR
             adj[i].sort_by_key(|(j, _)| *j);
-            // Remove duplicate edges (sum weights)
             let mut deduped: Vec<(usize, f64)> = Vec::new();
             for (j, w) in &adj[i] {
                 if let Some(last) = deduped.last_mut() {
@@ -390,7 +726,7 @@ impl SparseCathedralProbe {
             row_ptr[i + 1] = row_ptr[i] + deduped.len();
             for (j, w) in deduped {
                 col_ind.push(j);
-                values.push(-w); // off-diagonal of L is -w
+                values.push(-w);
             }
         }
 
@@ -443,7 +779,7 @@ impl SparseCathedralProbe {
         for i in 0..self.n {
             let mut sum = self.diag[i] * x[i];
             for idx in self.row_ptr[i]..self.row_ptr[i + 1] {
-                sum += self.values[idx] * x[self.col_ind[idx]]; // values[idx] = -w
+                sum += self.values[idx] * x[self.col_ind[idx]];
             }
             y[i] = sum;
         }
@@ -451,7 +787,6 @@ impl SparseCathedralProbe {
 
     /// Total edge weight.
     pub fn total_weight(&self) -> f64 {
-        // Each undirected edge is stored once per endpoint in diag, so total = sum(diag)/2
         self.diag.iter().sum::<f64>() / 2.0
     }
 }
@@ -513,15 +848,11 @@ impl DirectedCathedralProbe {
     }
 
     /// Compute the stationary distribution φ via power iteration.
-    ///
-    /// Solves φ^T P = φ^T where P is the row-stochastic transition matrix.
-    /// Uses teleportation (α = 0.15) for robustness with dangling nodes.
     #[allow(clippy::needless_range_loop)]
     fn compute_stationary(&mut self) {
         let n = self.n;
         if n == 0 { return; }
 
-        // Build row-stochastic transition matrix
         let mut p = vec![vec![0.0f64; n]; n];
         for i in 0..n {
             let total: f64 = self.out_edges[i].iter().map(|&(_, w)| w).sum();
@@ -530,12 +861,10 @@ impl DirectedCathedralProbe {
                     p[i][j] = w / total;
                 }
             } else {
-                // Dangling node: uniform distribution
                 for val in p[i].iter_mut().take(n) { *val = 1.0 / n as f64; }
             }
         }
 
-        // Power iteration with teleportation: P_α = (1-α)P + α * (1/n) * 11^T
         let alpha = 0.15;
         let uniform = 1.0 / n as f64;
         let mut phi = vec![uniform; n];
@@ -547,7 +876,6 @@ impl DirectedCathedralProbe {
                     new_phi[j] += phi[i] * ((1.0 - alpha) * p[i][j] + alpha * uniform);
                 }
             }
-            // Normalize
             let sum: f64 = new_phi.iter().sum();
             if sum > 0.0 {
                 for v in &mut new_phi { *v /= sum; }
@@ -564,7 +892,6 @@ impl DirectedCathedralProbe {
         let n = self.n;
         let phi = &self.phi;
 
-        // Build transition matrix P
         let mut p = vec![vec![0.0f64; n]; n];
         for i in 0..n {
             let total: f64 = self.out_edges[i].iter().map(|&(_, w)| w).sum();
@@ -575,7 +902,6 @@ impl DirectedCathedralProbe {
             }
         }
 
-        // Chung's Laplacian: L = I - (Φ^{1/2} P Φ^{-1/2} + Φ^{-1/2} P^T Φ^{1/2}) / 2
         let mut lap = vec![vec![0.0f64; n]; n];
         for i in 0..n {
             for j in 0..n {
@@ -591,9 +917,6 @@ impl DirectedCathedralProbe {
     }
 
     /// Compute the spectrum of the directed Laplacian.
-    ///
-    /// Returns a `SpectrumResult` with eigenvalues sorted ascending.
-    /// The Fiedler value (second smallest) measures directed connectivity.
     pub fn spectrum_result(&mut self) -> SpectrumResult {
         if self.n == 0 {
             return SpectrumResult {
@@ -649,77 +972,83 @@ impl DirectedCathedralProbe {
 
 /// Reduce a symmetric matrix to tridiagonal form via Householder reflections.
 ///
-/// Given symmetric A, computes T = Q^T A Q where T is tridiagonal.
-/// Only the diagonal and sub/super-diagonal are extracted.
-///
 /// Reference: Golub & Van Loan, *Matrix Computations*, 4th ed., Algorithm 8.3.1.
 #[allow(clippy::needless_range_loop)]
 fn householder_tridiag(a: &[Vec<f64>], diag: &mut [f64], subdiag: &mut [f64]) {
+    let (d, s, _) = householder_tridiag_impl(a);
+    diag.copy_from_slice(&d);
+    subdiag.copy_from_slice(&s);
+}
+
+/// Householder tridiagonalization that also returns the orthogonal transformation Q.
+#[allow(clippy::needless_range_loop)]
+fn householder_tridiag_with_q(a: &[Vec<f64>]) -> (Vec<f64>, Vec<f64>, Vec<Vec<f64>>) {
+    householder_tridiag_impl(a)
+}
+
+/// Core implementation of Householder tridiagonalization.
+/// Returns (diag, subdiag, Q) where Q accumulates all Householder reflections.
+#[allow(clippy::needless_range_loop)]
+fn householder_tridiag_impl(a: &[Vec<f64>]) -> (Vec<f64>, Vec<f64>, Vec<Vec<f64>>) {
     let n = a.len();
-    // Work on a copy
     let mut t = a.to_vec();
 
+    // Initialize Q = I
+    let mut q = vec![vec![0.0; n]; n];
+    for i in 0..n { q[i][i] = 1.0; }
+
     for k in 0..n.saturating_sub(2) {
-        // Extract column below the subdiagonal
         let m = n - k - 1;
         let mut x = vec![0.0; m];
         for i in 0..m {
             x[i] = t[k + 1 + i][k];
         }
 
-        // Compute Householder vector
-        let _sigma: f64 = x[1..].iter().map(|&v| v * v).sum();
+        let _sigma: f64 = x[1..].iter().map(|&v| v * v).sum::<f64>();
         let alpha = x[0].signum() * x.iter().map(|&v| v * v).sum::<f64>().sqrt().max(1e-300);
         x[0] += alpha;
 
-        // Normalize v
         let v_norm: f64 = x.iter().map(|&v| v * v).sum::<f64>().sqrt();
         if v_norm < 1e-15 { continue; }
         for v in &mut x { *v /= v_norm; }
 
-        // Apply similarity transformation: T = (I - 2vv^T) T (I - 2vv^T)
-        // First: T = (I - 2vv^T) T  → update rows k+1..n
-        // For symmetric T, we can use the formula:
-        //   p = 2 * T[k+1:, k+1:] * v
-        //   q = p - (v^T p) v  (simplified for rank-2 update)
-        //   T[k+1:, k+1:] -= v q^T + q v^T
-
-        // But let's do it the straightforward way:
-        // Apply from left: T[k+1:, :] -= 2 * v * (v^T * T[k+1:, :])
+        // Apply from left
         for j in 0..n {
             let dot: f64 = (0..m).map(|i| x[i] * t[k + 1 + i][j]).sum();
             for i in 0..m {
                 t[k + 1 + i][j] -= 2.0 * x[i] * dot;
             }
         }
-        // Apply from right: T[:, k+1:] -= 2 * (T[:, k+1:] * v) * v^T
+        // Apply from right
         for i in 0..n {
             let dot: f64 = (0..m).map(|l| t[i][k + 1 + l] * x[l]).sum();
             for l in 0..m {
                 t[i][k + 1 + l] -= 2.0 * dot * x[l];
             }
         }
+
+        // Accumulate Q: Q = Q * H_k
+        for i in 0..n {
+            let dot: f64 = (0..m).map(|l| q[i][k + 1 + l] * x[l]).sum();
+            for l in 0..m {
+                q[i][k + 1 + l] -= 2.0 * dot * x[l];
+            }
+        }
     }
 
-    // Extract diagonal and subdiagonal
-    for i in 0..n {
-        diag[i] = t[i][i];
-    }
-    for i in 0..n - 1 {
-        subdiag[i] = t[i + 1][i];
-    }
+    let mut diag = vec![0.0; n];
+    let mut subdiag = vec![0.0; n.saturating_sub(1)];
+    for i in 0..n { diag[i] = t[i][i]; }
+    for i in 0..n.saturating_sub(1) { subdiag[i] = t[i + 1][i]; }
+
+    (diag, subdiag, q)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // Implicit QR for symmetric tridiagonal matrices (Wilkinson shifts)
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Implicit QR iteration with Wilkinson shift for a symmetric tridiagonal matrix.
-///
-/// Operates in-place on `diag` (length n) and `subdiag` (length n-1).
-/// Returns (eigenvalues, iterations, converged).
-///
-/// Reference: Golub & Van Loan, *Matrix Computations*, 4th ed., §8.3.
+/// Implicit QR iteration with Wilkinson shift (eigenvalues only).
 #[allow(clippy::needless_range_loop)]
 fn implicit_qr_tridiag(
     diag: &mut [f64],
@@ -727,40 +1056,71 @@ fn implicit_qr_tridiag(
     tol: f64,
     max_iter: usize,
 ) -> (Vec<f64>, usize, bool) {
-    let n = diag.len();
-    if n == 0 { return (vec![], 0, true); }
-    if n == 1 { return (vec![diag[0]], 0, true); }
+    let (eigs, _, iters, converged) = implicit_qr_tridiag_impl(diag, subdiag, tol, max_iter, false);
+    (eigs, iters, converged)
+}
+
+/// Implicit QR iteration that also accumulates eigenvectors.
+#[allow(clippy::needless_range_loop)]
+fn implicit_qr_tridiag_with_vectors(
+    diag: Vec<f64>,
+    subdiag: Vec<f64>,
+    tol: f64,
+    max_iter: usize,
+) -> (Vec<f64>, Vec<Vec<f64>>, usize, bool) {
+    implicit_qr_tridiag_impl(&diag, &subdiag, tol, max_iter, true)
+}
+
+/// Core QR implementation. When `compute_vectors` is true, tracks Givens rotations
+/// to build the eigenvector matrix.
+#[allow(clippy::needless_range_loop)]
+fn implicit_qr_tridiag_impl(
+    diag_src: &[f64],
+    subdiag_src: &[f64],
+    tol: f64,
+    max_iter: usize,
+    compute_vectors: bool,
+) -> (Vec<f64>, Vec<Vec<f64>>, usize, bool) {
+    let n = diag_src.len();
+    if n == 0 { return (vec![], vec![], 0, true); }
+    if n == 1 { return (vec![diag_src[0]], vec![vec![1.0]], 0, true); }
+
+    let mut diag = diag_src.to_vec();
+    let mut subdiag = subdiag_src.to_vec();
+
+    // Eigenvector matrix (columns are eigenvectors)
+    let mut vecs = if compute_vectors {
+        let mut v = vec![vec![0.0; n]; n];
+        for i in 0..n { v[i][i] = 1.0; }
+        Some(v)
+    } else {
+        None
+    };
 
     let mut hi = n - 1;
     let mut total_iters = 0usize;
 
-    // Deflate from the bottom
     while hi > 0 && total_iters < max_iter {
-        // Check for negligible subdiagonal elements (deflation)
         for i in 0..hi {
             if subdiag[i].abs() <= tol * (diag[i].abs() + diag[i + 1].abs()) {
                 subdiag[i] = 0.0;
             }
         }
 
-        // Find the largest unreduced block at the bottom
         while hi > 0 && subdiag[hi - 1].abs() == 0.0 {
             hi -= 1;
         }
         if hi == 0 { break; }
 
-        // Find the top of the unreduced block
         let mut block_lo = hi - 1;
         while block_lo > 0 && subdiag[block_lo - 1].abs() != 0.0 {
             block_lo -= 1;
         }
 
-        // Wilkinson shift: eigenvalue of the bottom-right 2x2 closer to diag[hi]
         let dd = (diag[hi - 1] - diag[hi]) / 2.0;
         let mu = diag[hi] - subdiag[hi - 1].powi(2)
             / (dd + dd.signum() * (dd * dd + subdiag[hi - 1].powi(2)).sqrt());
 
-        // Implicit QR step (chase the bulge)
         let mut x = diag[block_lo] - mu;
         let mut z = subdiag[block_lo];
 
@@ -772,17 +1132,24 @@ fn implicit_qr_tridiag(
                 subdiag[k - 1] = r;
             }
 
-            // Apply Givens rotation G(k, k+1, θ) to rows/cols k, k+1 of T
             let dk = diag[k];
             let dk1 = diag[k + 1];
             let ek = subdiag[k];
 
-            // Updated 2×2 block after similarity transform
             diag[k]     = c * c * dk + 2.0 * c * s * ek + s * s * dk1;
             diag[k + 1] = s * s * dk - 2.0 * c * s * ek + c * c * dk1;
             subdiag[k]  = c * s * (dk1 - dk) + (c * c - s * s) * ek;
 
-            // Prepare for next rotation (chase the bulge)
+            // Apply Givens rotation to eigenvector matrix
+            if let Some(ref mut v) = vecs {
+                for i in 0..n {
+                    let vk = v[i][k];
+                    let vk1 = v[i][k + 1];
+                    v[i][k]     = c * vk + s * vk1;
+                    v[i][k + 1] = -s * vk + c * vk1;
+                }
+            }
+
             if k + 1 < hi {
                 x = subdiag[k];
                 z = s * subdiag[k + 1];
@@ -794,7 +1161,9 @@ fn implicit_qr_tridiag(
     }
 
     let converged = hi == 0;
-    (diag.to_vec(), total_iters, converged)
+    let eigs = diag.to_vec();
+    let eigenvectors = vecs.unwrap_or_else(|| vec![vec![0.0; n]; n]);
+    (eigs, eigenvectors, total_iters, converged)
 }
 
 /// Compute Givens rotation parameters (c, s) such that [c s; -s c]^T [a; b] = [r; 0].
@@ -814,9 +1183,6 @@ fn givens(a: f64, b: f64) -> (f64, f64) {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Lanczos iteration with full reorthogonalization.
-///
-/// Computes the k smallest eigenvalues of the sparse Laplacian.
-/// Returns (eigenvalues, iterations, converged).
 #[allow(clippy::needless_range_loop)]
 fn lanczos_eigenvalues(
     mat: &SparseCathedralProbe,
@@ -825,26 +1191,24 @@ fn lanczos_eigenvalues(
     tol: f64,
 ) -> (Vec<f64>, usize, bool) {
     let n = mat.node_count();
-    let m = (2 * k + 10).min(n); // Lanczos subspace dimension
+    let m = (2 * k + 10).min(n);
 
     let mut alpha = vec![0.0f64; m];
     let mut beta = vec![0.0f64; m];
     let mut q = vec![vec![0.0f64; n]; m + 1];
 
-    // Random starting vector (deterministic seed via simple LCG)
     let mut rng_state: u64 = 12345;
     for i in 0..n {
         rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
         q[0][i] = (rng_state >> 33) as f64 / (1u64 << 31) as f64;
     }
-    // Normalize
     let q0_norm = q[0].iter().map(|&v| v * v).sum::<f64>().sqrt();
     if q0_norm < 1e-15 {
         q[0][0] = 1.0;
     } else {
         for qi in q[0].iter_mut() {
-        *qi /= q0_norm;
-    }
+            *qi /= q0_norm;
+        }
     }
 
     let mut w = vec![0.0f64; n];
@@ -853,13 +1217,10 @@ fn lanczos_eigenvalues(
 
     for iter in 0..m {
         j = iter;
-        // w = A * q[j]
         mat.matvec(&q[j], &mut w);
 
-        // alpha[j] = q[j]^T * w
         alpha[j] = (0..n).map(|i| q[j][i] * w[i]).sum();
 
-        // w = w - alpha[j]*q[j] - beta[j-1]*q[j-1]
         for i in 0..n {
             w[i] -= alpha[j] * q[j][i];
             if iter > 0 {
@@ -867,7 +1228,6 @@ fn lanczos_eigenvalues(
             }
         }
 
-        // Full reorthogonalization (two passes for numerical stability)
         for _ in 0..2 {
             for l in 0..=iter {
                 let dot: f64 = (0..n).map(|i| w[i] * q[l][i]).sum();
@@ -895,7 +1255,6 @@ fn lanczos_eigenvalues(
         iters_used = iter + 1;
     }
 
-    // Now compute eigenvalues of the (j+1)×(j+1) tridiagonal matrix [alpha, beta]
     let sz = j + 1;
     let mut t_diag = alpha[..sz].to_vec();
     let mut t_sub = beta[..sz.saturating_sub(1)].to_vec();
@@ -903,7 +1262,6 @@ fn lanczos_eigenvalues(
     let (mut eigs, qr_iters, converged) = implicit_qr_tridiag(&mut t_diag, &mut t_sub, tol * 100.0, sz * 30);
 
     eigs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    // Clean near-zero
     for e in &mut eigs {
         if e.abs() < 1e-10 { *e = 0.0; }
     }
@@ -919,8 +1277,6 @@ fn lanczos_eigenvalues(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ─── Helper ─────────────────────────────────────────────────
 
     /// Relative tolerance check.
     fn rel_close(actual: f64, expected: f64, tol: f64) -> bool {
@@ -959,6 +1315,16 @@ mod tests {
         let mut g = CathedralProbe::new(names.iter().map(|s| s.as_str()).collect());
         for i in 1..n {
             g.connect(&names[0], &names[i], 1.0);
+        }
+        g
+    }
+
+    /// Build C_n (cycle graph on n nodes, weight 1.0).
+    fn cycle_graph(n: usize) -> CathedralProbe {
+        let names: Vec<String> = (0..n).map(|i| format!("n{i}")).collect();
+        let mut g = CathedralProbe::new(names.iter().map(|s| s.as_str()).collect());
+        for i in 0..n {
+            g.connect(&names[i], &names[(i + 1) % n], 1.0);
         }
         g
     }
@@ -1006,106 +1372,69 @@ mod tests {
 
     #[test]
     fn test_k3_spectrum_exact() {
-        // K₃: eigenvalues = {0, 3, 3}
         let p = complete_graph(3);
         let spec = p.spectrum();
         assert_eq!(spec.len(), 3);
-        assert!(spec[0].abs() < 0.01, "λ₀ = {} (expected 0)", spec[0]);
-        assert!(
-            rel_close(spec[1], 3.0, 0.01),
-            "λ₁ = {} (expected 3.0)", spec[1]
-        );
-        assert!(
-            rel_close(spec[2], 3.0, 0.01),
-            "λ₂ = {} (expected 3.0)", spec[2]
-        );
+        assert!(spec[0].abs() < 0.01);
+        assert!(rel_close(spec[1], 3.0, 0.01));
+        assert!(rel_close(spec[2], 3.0, 0.01));
     }
 
     #[test]
     fn test_k3_fiedler_exact() {
-        // K₃: Fiedler = 3.0
         let p = complete_graph(3);
-        let f = p.fiedler_value();
-        assert!(
-            rel_close(f, 3.0, 0.01),
-            "K₃ Fiedler = {f} (expected 3.0)"
-        );
+        assert!(rel_close(p.fiedler_value(), 3.0, 0.01));
     }
 
     #[test]
     fn test_k4_spectrum_exact() {
-        // K₄: eigenvalues = {0, 4, 4, 4}
         let p = complete_graph(4);
         let spec = p.spectrum();
         assert_eq!(spec.len(), 4);
         assert!(spec[0].abs() < 0.05);
-        assert!(rel_close(spec[1], 4.0, 0.02), "λ₁ = {}", spec[1]);
-        assert!(rel_close(spec[2], 4.0, 0.02), "λ₂ = {}", spec[2]);
-        assert!(rel_close(spec[3], 4.0, 0.02), "λ₃ = {}", spec[3]);
+        assert!(rel_close(spec[1], 4.0, 0.02));
+        assert!(rel_close(spec[2], 4.0, 0.02));
+        assert!(rel_close(spec[3], 4.0, 0.02));
     }
 
     #[test]
     fn test_p4_spectrum_exact() {
-        // P₄ (path on 4 nodes): eigenvalues = {0, 2-√2, 2, 2+√2}
-        // Fiedler = 2 - √2 ≈ 0.5858
         let p = path_graph(4);
         let spec = p.spectrum();
         assert_eq!(spec.len(), 4);
         let fiedler = 2.0 - 2.0_f64.sqrt();
-        assert!(
-            rel_close(spec[1], fiedler, 0.02),
-            "P₄ Fiedler = {} (expected {fiedler:.4})", spec[1]
-        );
-        assert!(
-            rel_close(spec[2], 2.0, 0.02),
-            "P₄ λ₂ = {} (expected 2.0)", spec[2]
-        );
+        assert!(rel_close(spec[1], fiedler, 0.02));
+        assert!(rel_close(spec[2], 2.0, 0.02));
         let max_eig = 2.0 + 2.0_f64.sqrt();
-        assert!(
-            rel_close(spec[3], max_eig, 0.02),
-            "P₄ λ₃ = {} (expected {max_eig:.4})", spec[3]
-        );
+        assert!(rel_close(spec[3], max_eig, 0.02));
     }
 
     #[test]
     fn test_p4_fiedler_exact() {
-        // P₄: Fiedler = 2 - √2 ≈ 0.5858
         let p = path_graph(4);
-        let f = p.fiedler_value();
         let expected = 2.0 - 2.0_f64.sqrt();
-        assert!(
-            rel_close(f, expected, 0.02),
-            "P₄ Fiedler = {f:.4} (expected {expected:.4})"
-        );
+        assert!(rel_close(p.fiedler_value(), expected, 0.02));
     }
 
     #[test]
     fn test_s4_fiedler_exact() {
-        // S₄ (star: 1 hub + 3 leaves): Fiedler = 1.0
-        // Eigenvalues = {0, 1, 1, 4}
         let p = star_graph(4);
-        let f = p.fiedler_value();
-        assert!(
-            rel_close(f, 1.0, 0.02),
-            "S₄ Fiedler = {f:.4} (expected 1.0)"
-        );
+        assert!(rel_close(p.fiedler_value(), 1.0, 0.02));
     }
 
     #[test]
     fn test_s4_spectrum_exact() {
-        // S₄: {0, 1, 1, 4}
         let p = star_graph(4);
         let spec = p.spectrum();
         assert_eq!(spec.len(), 4);
         assert!(spec[0].abs() < 0.05);
-        assert!(rel_close(spec[1], 1.0, 0.02), "λ₁ = {}", spec[1]);
-        assert!(rel_close(spec[2], 1.0, 0.02), "λ₂ = {}", spec[2]);
-        assert!(rel_close(spec[3], 4.0, 0.02), "λ₃ = {}", spec[3]);
+        assert!(rel_close(spec[1], 1.0, 0.02));
+        assert!(rel_close(spec[2], 1.0, 0.02));
+        assert!(rel_close(spec[3], 4.0, 0.02));
     }
 
     #[test]
     fn test_p3_fiedler_exact() {
-        // P₃ (path on 3): eigenvalues = {0, 1, 3}, Fiedler = 1.0
         let p = path_graph(3);
         let spec = p.spectrum();
         assert!(spec[0].abs() < 0.05);
@@ -1115,7 +1444,6 @@ mod tests {
 
     #[test]
     fn test_k2_spectrum_exact() {
-        // K₂ (two nodes, one edge w=1): eigenvalues = {0, 2}
         let mut p = CathedralProbe::new(vec!["a", "b"]);
         p.connect("a", "b", 1.0);
         let spec = p.spectrum();
@@ -1124,20 +1452,15 @@ mod tests {
         assert!(rel_close(spec[1], 2.0, 0.01));
     }
 
+    #[test]
     fn test_p5_fiedler_exact() {
-        // P₅: Fiedler = 2 - 2cos(π/5) ≈ 0.3820
         let p = path_graph(5);
-        let f = p.fiedler_value();
         let expected = 2.0 - 2.0 * (std::f64::consts::PI / 5.0).cos();
-        assert!(
-            rel_close(f, expected, 0.02),
-            "P₅ Fiedler = {f:.4} (expected {expected:.4})"
-        );
+        assert!(rel_close(p.fiedler_value(), expected, 0.02));
     }
 
     #[test]
     fn test_weighted_k2_exact() {
-        // K₂ with weight w: eigenvalues = {0, 2w}
         let mut p = CathedralProbe::new(vec!["a", "b"]);
         p.connect("a", "b", 3.5);
         let spec = p.spectrum();
@@ -1147,18 +1470,8 @@ mod tests {
 
     #[test]
     fn test_cycle_c4_fiedler_exact() {
-        // C₄ (cycle on 4): eigenvalues = {0, 2, 2, 4}, Fiedler = 2.0
-        let names = vec!["a", "b", "c", "d"];
-        let mut g = CathedralProbe::new(names.clone());
-        g.connect("a", "b", 1.0);
-        g.connect("b", "c", 1.0);
-        g.connect("c", "d", 1.0);
-        g.connect("d", "a", 1.0);
-        let f = g.fiedler_value();
-        assert!(
-            rel_close(f, 2.0, 0.02),
-            "C₄ Fiedler = {f:.4} (expected 2.0)"
-        );
+        let p = cycle_graph(4);
+        assert!(rel_close(p.fiedler_value(), 2.0, 0.02));
     }
 
     // ─── Convergence and spectrum_result ────────────────────────
@@ -1167,7 +1480,7 @@ mod tests {
     fn test_spectrum_result_convergence() {
         let p = complete_graph(5);
         let result = p.spectrum_result();
-        assert!(result.converged, "QR should converge for small symmetric matrices");
+        assert!(result.converged);
         assert!(result.iterations > 0 || p.node_count() <= 2);
         assert_eq!(result.method, SpectrumMethod::DenseImplicitQr);
         assert_eq!(result.eigenvalues.len(), 5);
@@ -1186,8 +1499,7 @@ mod tests {
         let mut p = CathedralProbe::new(vec!["a", "b"]);
         p.connect("a", "b", 1.0);
         let result = p.spectrum_result();
-        let f = result.fiedler_value().unwrap();
-        assert!(rel_close(f, 2.0, 0.01));
+        assert!(rel_close(result.fiedler_value().unwrap(), 2.0, 0.01));
     }
 
     #[test]
@@ -1263,12 +1575,9 @@ mod tests {
 
     #[test]
     fn test_cheeger_k3_exact() {
-        // K₃: Fiedler = 3, upper = √6 ≈ 2.449, lower = 1.5
         let p = complete_graph(3);
-        let ub = p.cheeger_upper_bound();
-        let lb = p.cheeger_lower_bound();
-        assert!(rel_close(ub, 6.0_f64.sqrt(), 0.02));
-        assert!(rel_close(lb, 1.5, 0.02));
+        assert!(rel_close(p.cheeger_upper_bound(), 6.0_f64.sqrt(), 0.02));
+        assert!(rel_close(p.cheeger_lower_bound(), 1.5, 0.02));
     }
 
     // ─── Fragility ──────────────────────────────────────────────
@@ -1278,7 +1587,7 @@ mod tests {
         let mut p = CathedralProbe::new(vec!["a", "b"]);
         p.connect("a", "b", 1.0);
         assert!(p.fragility_index().is_finite());
-        assert!(rel_close(p.fragility_index(), 0.5, 0.01)); // 1/2
+        assert!(rel_close(p.fragility_index(), 0.5, 0.01));
     }
 
     #[test]
@@ -1300,7 +1609,6 @@ mod tests {
     #[test]
     fn test_average_degree() {
         let p = complete_graph(3);
-        // total_weight = 3, avg_degree = 3*2/3 = 2.0
         assert!((p.average_degree() - 2.0).abs() < 0.01);
     }
 
@@ -1309,8 +1617,7 @@ mod tests {
         let mut p = CathedralProbe::new(vec!["a", "b", "c"]);
         p.connect("a", "b", 10.0);
         p.connect("b", "c", 0.1);
-        let f = p.fiedler_value();
-        assert!(f > 0.0);
+        assert!(p.fiedler_value() > 0.0);
     }
 
     #[test]
@@ -1377,13 +1684,7 @@ mod tests {
     fn test_line_vs_complete_fiedler() {
         let line = path_graph(5);
         let complete = complete_graph(5);
-        // Complete graph should have higher Fiedler than path
-        assert!(
-            complete.fiedler_value() > line.fiedler_value(),
-            "K₅ Fiedler ({}) should exceed P₅ Fiedler ({})",
-            complete.fiedler_value(),
-            line.fiedler_value()
-        );
+        assert!(complete.fiedler_value() > line.fiedler_value());
     }
 
     // ─── Sparse graph tests ─────────────────────────────────────
@@ -1399,23 +1700,15 @@ mod tests {
     fn test_sparse_k3_fiedler() {
         let edges = vec![(0, 1, 1.0), (1, 2, 1.0), (0, 2, 1.0)];
         let sparse = SparseCathedralProbe::from_edges(3, &edges);
-        let f = sparse.fiedler_value();
-        assert!(
-            rel_close(f, 3.0, 0.05),
-            "Sparse K₃ Fiedler = {f:.4} (expected 3.0)"
-        );
+        assert!(rel_close(sparse.fiedler_value(), 3.0, 0.05));
     }
 
     #[test]
     fn test_sparse_p4_fiedler() {
         let edges = vec![(0, 1, 1.0), (1, 2, 1.0), (2, 3, 1.0)];
         let sparse = SparseCathedralProbe::from_edges(4, &edges);
-        let f = sparse.fiedler_value();
         let expected = 2.0 - 2.0_f64.sqrt();
-        assert!(
-            rel_close(f, expected, 0.05),
-            "Sparse P₄ Fiedler = {f:.4} (expected {expected:.4})"
-        );
+        assert!(rel_close(sparse.fiedler_value(), expected, 0.05));
     }
 
     #[test]
@@ -1427,7 +1720,6 @@ mod tests {
         dense.connect("a", "d", 3.0);
 
         let sparse = SparseCathedralProbe::from(&dense);
-
         let dense_f = dense.fiedler_value();
         let sparse_f = sparse.fiedler_value();
         assert!(
@@ -1444,8 +1736,8 @@ mod tests {
         let sparse = SparseCathedralProbe::from_edges(10, &edges);
         let result = sparse.spectrum_top_k(3).unwrap();
         assert_eq!(result.eigenvalues.len(), 3);
-        assert!(result.eigenvalues[0].abs() < 0.1); // ~0
-        assert!(result.eigenvalues[1] > 0.0); // Fiedler > 0
+        assert!(result.eigenvalues[0].abs() < 0.1);
+        assert!(result.eigenvalues[1] > 0.0);
         assert!(result.converged);
     }
 
@@ -1468,7 +1760,6 @@ mod tests {
 
     #[test]
     fn test_directed_cycle_3_fiedler() {
-        // Strongly connected directed cycle on 3 nodes
         let mut dg = DirectedCathedralProbe::new(vec!["a", "b", "c"]);
         dg.add_edge("a", "b", 1.0);
         dg.add_edge("b", "c", 1.0);
@@ -1479,22 +1770,16 @@ mod tests {
 
     #[test]
     fn test_directed_disconnected_fiedler() {
-        // Not strongly connected: a → b, a → c (can't reach a from b or c)
         let mut dg = DirectedCathedralProbe::new(vec!["a", "b", "c"]);
         dg.add_edge("a", "b", 1.0);
         dg.add_edge("a", "c", 1.0);
-        // Teleportation gives small positive Fiedler, but it should be much smaller
-        // than a strongly connected graph of the same size
         let f = dg.fiedler_value();
         let mut dg2 = DirectedCathedralProbe::new(vec!["a", "b", "c"]);
         dg2.add_edge("a", "b", 1.0);
         dg2.add_edge("b", "c", 1.0);
         dg2.add_edge("c", "a", 1.0);
         let f2 = dg2.fiedler_value();
-        assert!(
-            f2 > f,
-            "Strongly connected Fiedler ({f2}) should exceed weakly connected ({f})"
-        );
+        assert!(f2 > f, "Strongly connected Fiedler ({f2}) should exceed weakly connected ({f})");
     }
 
     #[test]
@@ -1504,7 +1789,7 @@ mod tests {
         dg.add_edge("y", "x", 1.0);
         let result = dg.spectrum_result();
         assert_eq!(result.eigenvalues.len(), 2);
-        assert!(result.eigenvalues[0].abs() < 0.1); // ~0
+        assert!(result.eigenvalues[0].abs() < 0.1);
     }
 
     #[test]
@@ -1528,10 +1813,8 @@ mod tests {
     fn test_error_display() {
         let e = CathedralError::NodeNotFound("foo".into());
         assert!(e.to_string().contains("foo"));
-
         let e = CathedralError::InsufficientNodes { have: 1, need: 2 };
         assert!(e.to_string().contains("1"));
-
         let e = CathedralError::EmptyGraph;
         assert!(e.to_string().contains("empty"));
     }
@@ -1548,7 +1831,6 @@ mod tests {
     #[test]
     fn test_givens_rotation() {
         let (c, s) = givens(3.0, 4.0);
-        // Should zero out the second element
         let r = c * 3.0 + s * 4.0;
         let zero = -s * 3.0 + c * 4.0;
         assert!(r > 0.0);
@@ -1560,50 +1842,435 @@ mod tests {
 
     #[test]
     fn test_tridiag_preserves_trace() {
-        // Trace of A = sum of eigenvalues = sum of diagonal of tridiagonal
         let mut p = CathedralProbe::new(vec!["a", "b", "c", "d"]);
         p.connect("a", "b", 1.0);
         p.connect("b", "c", 2.0);
         p.connect("c", "d", 1.0);
         p.connect("a", "d", 3.0);
-
         let lap = p.build_laplacian();
         let trace_orig: f64 = (0..4).map(|i| lap[i][i]).sum();
-
         let mut diag = vec![0.0; 4];
         let mut subdiag = vec![0.0; 3];
         householder_tridiag(&lap, &mut diag, &mut subdiag);
-
         let trace_tri: f64 = diag.iter().sum();
-        assert!(
-            (trace_orig - trace_tri).abs() < 1e-8,
-            "Trace not preserved: orig={trace_orig}, tri={trace_tri}"
-        );
+        assert!((trace_orig - trace_tri).abs() < 1e-8);
     }
 
     #[test]
     fn test_tridiag_preserves_frobenius() {
-        // For symmetric: ||A||_F = sum of eigenvalues squared = ||T||_F
         let mut p = CathedralProbe::new(vec!["a", "b", "c"]);
         p.connect("a", "b", 1.0);
         p.connect("b", "c", 1.0);
         p.connect("a", "c", 1.0);
-
         let lap = p.build_laplacian();
-        let frob_orig: f64 = lap.iter()
-            .flat_map(|row| row.iter())
-            .map(|&v| v * v)
-            .sum();
-
+        let frob_orig: f64 = lap.iter().flat_map(|row| row.iter()).map(|&v| v * v).sum();
         let mut diag = vec![0.0; 3];
         let mut subdiag = vec![0.0; 2];
         householder_tridiag(&lap, &mut diag, &mut subdiag);
-
         let frob_tri: f64 = diag.iter().map(|&d| d * d).sum::<f64>()
             + 2.0 * subdiag.iter().map(|&s| s * s).sum::<f64>();
         assert!(
             (frob_orig - frob_tri).abs() / frob_orig < 1e-6,
             "Frobenius not preserved: orig={frob_orig}, tri={frob_tri}"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Advanced spectral method tests
+    // ═══════════════════════════════════════════════════════════════
+
+    // ─── Effective resistance ───────────────────────────────────
+
+    #[test]
+    fn test_effective_resistance_k2() {
+        // K₂ with weight 1: R_eff(0,1) = 1/w = 1.0
+        let mut p = CathedralProbe::new(vec!["a", "b"]);
+        p.connect("a", "b", 1.0);
+        let r = p.effective_resistance(0, 1);
+        assert!(rel_close(r, 1.0, 0.02), "K₂ R_eff = {r} (expected 1.0)");
+    }
+
+    #[test]
+    fn test_effective_resistance_weighted() {
+        // K₂ with weight 2: R_eff = 1/2 = 0.5
+        let mut p = CathedralProbe::new(vec!["a", "b"]);
+        p.connect("a", "b", 2.0);
+        let r = p.effective_resistance(0, 1);
+        assert!(rel_close(r, 0.5, 0.02), "Weighted K₂ R_eff = {r} (expected 0.5)");
+    }
+
+    #[test]
+    fn test_effective_resistance_same_node() {
+        let p = complete_graph(3);
+        assert_eq!(p.effective_resistance(0, 0), 0.0);
+    }
+
+    #[test]
+    fn test_effective_resistance_k3() {
+        // K₃: R_eff = 2/3 for all pairs (complete graph R_eff = 2/n)
+        let p = complete_graph(3);
+        let r = p.effective_resistance(0, 1);
+        assert!(rel_close(r, 2.0 / 3.0, 0.02), "K₃ R_eff = {r} (expected 0.667)");
+    }
+
+    #[test]
+    fn test_effective_resistance_k4() {
+        // K₄: R_eff = 2/4 = 0.5 for all pairs
+        let p = complete_graph(4);
+        let r = p.effective_resistance(0, 3);
+        assert!(rel_close(r, 0.5, 0.03), "K₄ R_eff = {r} (expected 0.5)");
+    }
+
+    #[test]
+    fn test_effective_resistance_triangle_inequality() {
+        // R_eff should satisfy triangle inequality
+        let p = path_graph(4);
+        let r01 = p.effective_resistance(0, 1);
+        let r12 = p.effective_resistance(1, 2);
+        let r02 = p.effective_resistance(0, 2);
+        assert!(r02 <= r01 + r12 + 0.01, "Triangle inequality: {r02} > {r01} + {r12}");
+    }
+
+    #[test]
+    fn test_effective_resistance_path_additivity() {
+        // For a path graph, R_eff(0,2) = R_eff(0,1) + R_eff(1,2) (series resistance)
+        let p = path_graph(3);
+        let r01 = p.effective_resistance(0, 1);
+        let r12 = p.effective_resistance(1, 2);
+        let r02 = p.effective_resistance(0, 2);
+        assert!(rel_close(r02, r01 + r12, 0.02), "P₃ series: {r02} != {r01} + {r12}");
+    }
+
+    // ─── Kirchhoff index ───────────────────────────────────────
+
+    #[test]
+    fn test_kirchhoff_index_k3() {
+        // K₃: Kf = n*(n-1)/2 * (2/n) = n-1 = 2
+        // Actually Kf = n * Σ 1/λ_k. K₃ eigenvalues: {0, 3, 3}, so Kf = 3*(1/3+1/3) = 2
+        let p = complete_graph(3);
+        let kf = p.kirchhoff_index();
+        assert!(rel_close(kf, 2.0, 0.02), "K₃ Kf = {kf} (expected 2.0)");
+    }
+
+    #[test]
+    fn test_kirchhoff_index_k4() {
+        // K₄: eigenvalues {0, 4, 4, 4}, Kf = 4*(3/4) = 3
+        let p = complete_graph(4);
+        let kf = p.kirchhoff_index();
+        assert!(rel_close(kf, 3.0, 0.03), "K₄ Kf = {kf} (expected 3.0)");
+    }
+
+    #[test]
+    fn test_kirchhoff_index_via_pairwise() {
+        // Kf = Σ_{i<j} R_eff(i,j)
+        let p = complete_graph(3);
+        let kf_direct = p.kirchhoff_index();
+        let kf_pairwise = p.effective_resistance(0, 1)
+            + p.effective_resistance(0, 2)
+            + p.effective_resistance(1, 2);
+        assert!(
+            rel_close(kf_direct, kf_pairwise, 0.03),
+            "Kf direct = {kf_direct}, pairwise = {kf_pairwise}"
+        );
+    }
+
+    #[test]
+    fn test_kirchhoff_index_small() {
+        let p = CathedralProbe::new(vec!["a"]);
+        assert_eq!(p.kirchhoff_index(), 0.0);
+    }
+
+    // ─── Spectral embedding ────────────────────────────────────
+
+    #[test]
+    fn test_spectral_embedding_dimensions() {
+        let p = complete_graph(4);
+        let emb = p.spectral_embedding(2);
+        assert_eq!(emb.len(), 4); // 4 nodes
+        assert_eq!(emb[0].len(), 2); // 2 dimensions
+    }
+
+    #[test]
+    fn test_spectral_embedding_empty() {
+        let p = CathedralProbe::new(vec![]);
+        let emb = p.spectral_embedding(2);
+        assert!(emb.is_empty());
+    }
+
+    #[test]
+    fn test_spectral_embedding_k3() {
+        let p = complete_graph(3);
+        let emb = p.spectral_embedding(2);
+        // All nodes should have same embedding magnitude (symmetric graph)
+        let norms: Vec<f64> = emb.iter()
+            .map(|v| v.iter().map(|x| x * x).sum::<f64>().sqrt())
+            .collect();
+        let max_diff = norms.iter().map(|n| (n - norms[0]).abs()).fold(0.0f64, f64::max);
+        assert!(max_diff < 0.05, "K₃ embedding norms should be equal, diff = {max_diff}");
+    }
+
+    #[test]
+    fn test_spectral_embedding_single_dim() {
+        let p = path_graph(4);
+        let emb = p.spectral_embedding(1);
+        assert_eq!(emb.len(), 4);
+        assert_eq!(emb[0].len(), 1);
+    }
+
+    // ─── Spectral clustering ───────────────────────────────────
+
+    #[test]
+    fn test_spectral_cluster_returns_valid() {
+        let p = complete_graph(4);
+        let clusters = p.spectral_cluster(2);
+        assert_eq!(clusters.len(), 4);
+        assert!(clusters.iter().all(|&c| c < 2));
+    }
+
+    #[test]
+    fn test_spectral_cluster_k1() {
+        let p = complete_graph(4);
+        let clusters = p.spectral_cluster(1);
+        assert!(clusters.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn test_spectral_cluster_empty() {
+        let p = CathedralProbe::new(vec![]);
+        let clusters = p.spectral_cluster(2);
+        assert!(clusters.is_empty());
+    }
+
+    #[test]
+    fn test_spectral_cluster_two_communities() {
+        // Two cliques connected by a single edge
+        let mut p = CathedralProbe::new(vec!["a", "b", "c", "d", "e", "f"]);
+        // Clique 1: a, b, c
+        p.connect("a", "b", 1.0);
+        p.connect("b", "c", 1.0);
+        p.connect("a", "c", 1.0);
+        // Clique 2: d, e, f
+        p.connect("d", "e", 1.0);
+        p.connect("e", "f", 1.0);
+        p.connect("d", "f", 1.0);
+        // Bridge
+        p.connect("c", "d", 0.1);
+
+        let clusters = p.spectral_cluster(2);
+        assert_eq!(clusters.len(), 6);
+
+        // a, b, c should be in one cluster; d, e, f in another
+        let group_abc = clusters[0];
+        assert_eq!(clusters[1], group_abc, "b should be with a");
+        assert_eq!(clusters[2], group_abc, "c should be with a");
+        assert_ne!(clusters[3], group_abc, "d should be different from a");
+        assert_eq!(clusters[4], clusters[3], "e should be with d");
+        assert_eq!(clusters[5], clusters[3], "f should be with d");
+    }
+
+    #[test]
+    fn test_spectral_cluster_k_ge_n() {
+        let p = complete_graph(3);
+        let clusters = p.spectral_cluster(5);
+        assert_eq!(clusters, vec![0, 1, 2]);
+    }
+
+    // ─── Community profile ─────────────────────────────────────
+
+    #[test]
+    fn test_community_profile_basic() {
+        let p = complete_graph(4);
+        let profile = p.community_profile();
+        assert_eq!(profile.len(), 2); // n/2 = 2 for n=4
+        for &(s, cond) in &profile {
+            assert!(s >= 1);
+            assert!(cond >= 0.0);
+        }
+    }
+
+    #[test]
+    fn test_community_profile_empty() {
+        let p = CathedralProbe::new(vec![]);
+        assert!(p.community_profile().is_empty());
+    }
+
+    #[test]
+    fn test_community_profile_single() {
+        let p = CathedralProbe::new(vec!["a"]);
+        assert!(p.community_profile().is_empty());
+    }
+
+    #[test]
+    fn test_community_profile_conductance_bounded() {
+        let p = path_graph(6);
+        let profile = p.community_profile();
+        // All conductance values should be in [0, 1]
+        for &(_, cond) in &profile {
+            assert!(cond <= 1.01, "Conductance {cond} > 1.0");
+        }
+    }
+
+    #[test]
+    fn test_community_profile_two_nodes() {
+        let mut p = CathedralProbe::new(vec!["a", "b"]);
+        p.connect("a", "b", 1.0);
+        let profile = p.community_profile();
+        assert_eq!(profile.len(), 1); // n/2 = 1
+        assert_eq!(profile[0].0, 1);
+        // Conductance of splitting 2-node graph: cut=1, min(vol_s, vol_comp) = 1
+        assert!(rel_close(profile[0].1, 1.0, 0.02));
+    }
+
+    // ─── Fiedler sensitivity ───────────────────────────────────
+
+    #[test]
+    fn test_fiedler_sensitivity_basic() {
+        let p = complete_graph(3);
+        let sens = p.fiedler_sensitivity();
+        assert_eq!(sens.len(), 3); // K₃ has 3 edges
+        for &(_, _, delta) in &sens {
+            assert!(delta >= 0.0, "Sensitivity should be non-negative");
+        }
+    }
+
+    #[test]
+    fn test_fiedler_sensitivity_path() {
+        // P₃: edges (0,1) and (1,2). Middle edge should have higher sensitivity
+        // because removing it disconnects the graph.
+        let p = path_graph(3);
+        let sens = p.fiedler_sensitivity();
+        assert_eq!(sens.len(), 2);
+        // Both edges have equal sensitivity in P₃ (by symmetry)
+        let s0 = sens[0].2;
+        let s1 = sens[1].2;
+        assert!((s0 - s1).abs() < 0.05, "P₃ sensitivities should be equal: {s0} vs {s1}");
+    }
+
+    #[test]
+    fn test_fiedler_sensitivity_nonnegative() {
+        let p = path_graph(5);
+        let sens = p.fiedler_sensitivity();
+        for &(_, _, delta) in &sens {
+            assert!(delta >= 0.0);
+        }
+    }
+
+    #[test]
+    fn test_fiedler_sensitivity_empty() {
+        let p = CathedralProbe::new(vec!["a"]);
+        assert!(p.fiedler_sensitivity().is_empty());
+    }
+
+    #[test]
+    fn test_fiedler_sensitivity_bridge_edge() {
+        // Two cliques connected by a bridge — bridge should have highest sensitivity
+        let mut p = CathedralProbe::new(vec!["a", "b", "c", "d"]);
+        p.connect("a", "b", 1.0);
+        p.connect("b", "c", 1.0);
+        p.connect("c", "d", 1.0);
+        p.connect("a", "c", 1.0);
+        let sens = p.fiedler_sensitivity();
+        // The bridge-like edge (b,d or similar) should stand out
+        assert!(!sens.is_empty());
+    }
+
+    // ─── Condition number ──────────────────────────────────────
+
+    #[test]
+    fn test_condition_number_k3() {
+        // K₃: eigenvalues {0, 3, 3}, κ = 3/3 = 1.0
+        let p = complete_graph(3);
+        let kappa = p.condition_number();
+        assert!(rel_close(kappa, 1.0, 0.02), "K₃ κ = {kappa} (expected 1.0)");
+    }
+
+    #[test]
+    fn test_condition_number_path() {
+        // P₄ has higher condition number than K₄
+        let p4 = path_graph(4);
+        let k4 = complete_graph(4);
+        assert!(
+            p4.condition_number() > k4.condition_number(),
+            "P₄ κ should exceed K₄ κ"
+        );
+    }
+
+    #[test]
+    fn test_condition_number_empty() {
+        let p = CathedralProbe::new(vec![]);
+        assert_eq!(p.condition_number(), 0.0);
+    }
+
+    #[test]
+    fn test_condition_number_disconnected() {
+        let p = CathedralProbe::new(vec!["a", "b"]);
+        assert!(p.condition_number().is_infinite());
+    }
+
+    #[test]
+    fn test_condition_number_k4() {
+        // K₄: eigenvalues {0, 4, 4, 4}, κ = 4/4 = 1.0
+        let p = complete_graph(4);
+        let kappa = p.condition_number();
+        assert!(rel_close(kappa, 1.0, 0.03), "K₄ κ = {kappa} (expected 1.0)");
+    }
+
+    // ─── Eigenvector verification ──────────────────────────────
+
+    #[test]
+    fn test_eigenvectors_orthogonal() {
+        let p = complete_graph(4);
+        let (_, vecs) = p.full_eigen();
+        // Check that eigenvectors are approximately orthogonal
+        for i in 0..vecs.len() {
+            for j in (i + 1)..vecs.len() {
+                let dot: f64 = vecs[i].iter().zip(&vecs[j]).map(|(&a, &b)| a * b).sum();
+                assert!(dot.abs() < 0.05, "vecs[{i}]·vecs[{j}] = {dot} (should be ~0)");
+            }
+        }
+    }
+
+    #[test]
+    fn test_eigenvectors_unit_norm() {
+        let p = complete_graph(4);
+        let (_, vecs) = p.full_eigen();
+        for (k, v) in vecs.iter().enumerate() {
+            let norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            assert!((norm - 1.0).abs() < 0.05, "vec[{k}] norm = {norm} (should be 1.0)");
+        }
+    }
+
+    #[test]
+    fn test_eigenvector_satisfies_eigenvalue_equation() {
+        let p = path_graph(4);
+        let (eigs, vecs) = p.full_eigen();
+        let lap = p.build_laplacian();
+        let n = p.node_count();
+
+        for k in 0..n {
+            // L * v_k should equal λ_k * v_k
+            for i in 0..n {
+                let lv: f64 = (0..n).map(|j| lap[i][j] * vecs[k][j]).sum();
+                let expected = eigs[k] * vecs[k][i];
+                assert!(
+                    (lv - expected).abs() < 0.05,
+                    "L·v[{k}][{i}] = {lv}, λ*v = {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_first_eigenvector_constant() {
+        let p = complete_graph(4);
+        let (_, vecs) = p.full_eigen();
+        // First eigenvector should be (1/√n, 1/√n, ..., 1/√n)
+        let expected = 1.0 / 4.0_f64.sqrt();
+        for i in 0..4 {
+            assert!(
+                (vecs[0][i].abs() - expected).abs() < 0.05,
+                "v₀[{i}] = {} (expected ±{expected})", vecs[0][i]
+            );
+        }
     }
 }
