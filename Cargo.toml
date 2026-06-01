@@ -1,0 +1,11 @@
+[package]
+name = "cathedral-probe"
+version = "0.1.0"
+edition = "2021"
+description = "Spectral topology analysis for microservice and component graphs — measure the health of the space between components"
+license = "MIT"
+repository = "https://github.com/SuperInstance/cathedral-probe"
+keywords = ["topology", "graph", "spectrum", "laplacian", "microservices"]
+categories = ["algorithms", "science"]
+
+[dev-dependencies]
