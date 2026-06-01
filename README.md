@@ -21,7 +21,7 @@ probe.connect("api", "cache", 0.5);
 
 println!("Fiedler value: {:.3}", probe.fiedler_value());
 println!("Is healthy: {}", probe.is_healthy(0.1));
-println!("Cheeger constant: {:.3}", probe.cheeger_constant());
+println!("Cheeger upper bound: {:.3}", probe.cheeger_upper_bound());
 ```
 
 ## What It Does
