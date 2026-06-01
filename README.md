@@ -84,7 +84,7 @@ let avg_deg = probe.average_degree();          // Average weighted degree
 4. The second-smallest eigenvalue (Fiedler value) measures algebraic connectivity
 5. Component importance is computed by removing each node and measuring Fiedler drop
 
-Zero dependencies. Works on `no_std` targets with `alloc`.
+Zero dependencies. Requires `std` (uses `HashMap`).
 
 ## Mathematical References
 
