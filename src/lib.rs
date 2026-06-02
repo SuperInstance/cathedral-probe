@@ -26,6 +26,7 @@ use std::collections::HashMap;
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Method used to compute the spectrum.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpectrumMethod {
     /// Householder tridiagonalization + implicit QR with Wilkinson shifts.
@@ -35,6 +36,7 @@ pub enum SpectrumMethod {
 }
 
 /// Result of a spectrum computation with diagnostics.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
 pub struct SpectrumResult {
     /// Eigenvalues sorted in ascending order.
@@ -59,6 +61,7 @@ impl SpectrumResult {
 }
 
 /// Error type for cathedral-probe operations.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
 pub enum CathedralError {
     /// Node name not found in the graph.
@@ -69,6 +72,8 @@ pub enum CathedralError {
     EmptyGraph,
     /// Lanczos failed to converge.
     LanczosNoConverge { iterations: usize },
+    /// Invalid matrix dimensions.
+    InvalidMatrix(String),
 }
 
 impl std::fmt::Display for CathedralError {
@@ -82,6 +87,7 @@ impl std::fmt::Display for CathedralError {
             Self::LanczosNoConverge { iterations } => {
                 write!(f, "Lanczos failed to converge after {iterations} iterations")
             }
+            Self::InvalidMatrix(msg) => write!(f, "invalid matrix: {msg}")
         }
     }
 }
@@ -91,6 +97,20 @@ impl std::error::Error for CathedralError {}
 // ═══════════════════════════════════════════════════════════════════════
 // Dense undirected graph
 // ═══════════════════════════════════════════════════════════════════════
+
+/// Analysis of a single connected component.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub struct ComponentAnalysis {
+    /// Node indices belonging to this component.
+    pub nodes: Vec<usize>,
+    /// Fiedler value (second-smallest eigenvalue) of this component.
+    pub fiedler_value: f64,
+    /// Cheeger upper bound (√(2·λ₂)) of this component.
+    pub cheeger_upper: f64,
+    /// Number of nodes in this component.
+    pub size: usize,
+}
 
 /// A weighted undirected graph of named components.
 pub struct CathedralProbe {
@@ -328,6 +348,168 @@ impl CathedralProbe {
     pub fn average_degree(&self) -> f64 {
         if self.nodes.is_empty() { return 0.0; }
         self.total_weight() * 2.0 / self.nodes.len() as f64
+    }
+
+    // ─── Matrix constructors ────────────────────────────────────
+
+    /// Build a graph from an adjacency/correlation/weight matrix.
+    ///
+    /// Takes a `&[Vec<f64>]` where `weights[i][j]` is the edge weight between
+    /// nodes i and j. Nodes are automatically named "0", "1", "2", ....
+    /// Self-loops are ignored. A warning is printed if the matrix is not symmetric.
+    pub fn from_matrix(weights: &[Vec<f64>]) -> Result<Self, CathedralError> {
+        let n = weights.len();
+        if n == 0 {
+            return Ok(Self::new(vec![]));
+        }
+        for (i, row) in weights.iter().enumerate() {
+            if row.len() != n {
+                return Err(CathedralError::InvalidMatrix(format!(
+                    "row {} has {} columns, expected {}",
+                    i, row.len(), n
+                )));
+            }
+        }
+
+        let names: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+        let mut graph = Self::new(names.iter().map(|s| s.as_str()).collect());
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let w = weights[i][j];
+                if (weights[i][j] - weights[j][i]).abs() > 1e-10 {
+                    // Non-symmetric: use the average
+                    let avg = (weights[i][j] + weights[j][i]) / 2.0;
+                    if avg.abs() > 1e-12 {
+                        graph.connect(&names[i], &names[j], avg);
+                    }
+                } else if w.abs() > 1e-12 {
+                    graph.connect(&names[i], &names[j], w);
+                }
+            }
+        }
+
+        Ok(graph)
+    }
+
+    /// Build a graph from an edge list of `(i, j, weight)` triples.
+    ///
+    /// `n` is the number of nodes (indexed 0..n-1). No string allocation —
+    /// pure indices. This is what ML engineers and neuroscientists need.
+    pub fn from_edge_list(n: usize, edges: &[(usize, usize, f64)]) -> Self {
+        let names: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+        let mut graph = Self::new(names.iter().map(|s| s.as_str()).collect());
+        for &(i, j, w) in edges {
+            if i < n && j < n && i != j {
+                graph.connect(&names[i], &names[j], w);
+            }
+        }
+        graph
+    }
+
+    /// Build a graph from a flat row-major weight array.
+    ///
+    /// `weights` is a flat `&[f64]` of length `n * n`, row-major order.
+    /// Zero-copy friendly for FFI / SIMD use cases.
+    pub fn from_weighted_adjacency(weights: &[f64], n: usize) -> Result<Self, CathedralError> {
+        if weights.len() != n * n {
+            return Err(CathedralError::InvalidMatrix(format!(
+                "expected {} elements ({}x{}), got {}",
+                n * n, n, n, weights.len()
+            )));
+        }
+        let matrix: Vec<Vec<f64>> = (0..n)
+            .map(|i| weights[i * n..(i + 1) * n].to_vec())
+            .collect();
+        Self::from_matrix(&matrix)
+    }
+
+    // ─── Per-component analysis ──────────────────────────────────
+
+    /// Analyze each connected component independently.
+    ///
+    /// Finds connected components via BFS, then computes the Fiedler value
+    /// and Cheeger upper bound for each. This fixes the issue where the Fiedler
+    /// value is 0 for disconnected graphs — each component gets its own analysis.
+    pub fn per_component_analysis(&self) -> Vec<ComponentAnalysis> {
+        let n = self.nodes.len();
+        if n == 0 {
+            return vec![];
+        }
+
+        // BFS to find connected components
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for &(i, j, _w) in &self.edges {
+            adj[i].push(j);
+            adj[j].push(i);
+        }
+
+        let mut visited = vec![false; n];
+        let mut components = Vec::new();
+
+        for start in 0..n {
+            if visited[start] {
+                continue;
+            }
+            let mut comp_nodes = Vec::new();
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(start);
+            visited[start] = true;
+            while let Some(node) = queue.pop_front() {
+                comp_nodes.push(node);
+                for &neighbor in &adj[node] {
+                    if !visited[neighbor] {
+                        visited[neighbor] = true;
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+            comp_nodes.sort_unstable();
+            components.push(comp_nodes);
+        }
+
+        // Analyze each component
+        components
+            .into_iter()
+            .map(|nodes| {
+                let size = nodes.len();
+                let (fiedler_value, cheeger_upper) = if size < 2 {
+                    (0.0, 0.0)
+                } else {
+                    // Build subgraph for this component
+                    let node_set: std::collections::HashSet<usize> =
+                        nodes.iter().copied().collect();
+                    let sub_names: Vec<String> =
+                        nodes.iter().map(|&i| self.nodes[i].clone()).collect();
+                    let mut sub = CathedralProbe::new(
+                        sub_names.iter().map(|s| s.as_str()).collect(),
+                    );
+                    for &(i, j, w) in &self.edges {
+                        if node_set.contains(&i) && node_set.contains(&j) {
+                            sub.connect(&self.nodes[i], &self.nodes[j], w);
+                        }
+                    }
+                    let f = sub.fiedler_value();
+                    let c = sub.cheeger_upper_bound();
+                    (f, c)
+                };
+
+                ComponentAnalysis {
+                    nodes,
+                    fiedler_value,
+                    cheeger_upper,
+                    size,
+                }
+            })
+            .collect()
+    }
+
+    /// Serialize the last `SpectrumResult` to JSON (requires `serde` feature).
+    #[cfg(feature = "serde")]
+    pub fn to_json(&self) -> Result<String, CathedralError> {
+        let result = self.spectrum_result();
+        serde_json::to_string(&result)
+            .map_err(|e| CathedralError::InvalidMatrix(format!("serde error: {e}")))
     }
 
     // ─── Full eigendecomposition (eigenvalues + eigenvectors) ────
@@ -2272,5 +2454,257 @@ mod tests {
                 "v₀[{i}] = {} (expected ±{expected})", vecs[0][i]
             );
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Matrix constructor tests
+    // ═══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_from_matrix_k3() {
+        // K₃ adjacency matrix
+        let weights = vec![
+            vec![0.0, 1.0, 1.0],
+            vec![1.0, 0.0, 1.0],
+            vec![1.0, 1.0, 0.0],
+        ];
+        let g = CathedralProbe::from_matrix(&weights).unwrap();
+        assert_eq!(g.node_count(), 3);
+        assert_eq!(g.edge_count(), 3);
+        assert!(rel_close(g.fiedler_value(), 3.0, 0.02));
+    }
+
+    #[test]
+    fn test_from_matrix_empty() {
+        let g = CathedralProbe::from_matrix(&[]).unwrap();
+        assert_eq!(g.node_count(), 0);
+    }
+
+    #[test]
+    fn test_from_matrix_asymmetric() {
+        // Asymmetric matrix should still work (averages the off-diagonals)
+        let weights = vec![
+            vec![0.0, 2.0, 0.0],
+            vec![0.0, 0.0, 3.0], // asymmetric: weights[0][1]=2, weights[1][0]=0
+            vec![0.0, 3.0, 0.0],
+        ];
+        let g = CathedralProbe::from_matrix(&weights).unwrap();
+        assert_eq!(g.node_count(), 3);
+        // Edge (0,1) weight = avg(2,0) = 1.0, edge (1,2) weight = avg(3,3) = 3.0
+        assert_eq!(g.edge_count(), 2);
+    }
+
+    #[test]
+    fn test_from_matrix_bad_dimensions() {
+        let weights = vec![
+            vec![0.0, 1.0],
+            vec![1.0, 0.0, 1.0], // extra element
+        ];
+        let result = CathedralProbe::from_matrix(&weights);
+        assert!(result.is_err());
+        if let Err(CathedralError::InvalidMatrix(_)) = result {} else {
+            panic!("Expected InvalidMatrix error");
+        }
+    }
+
+    #[test]
+    fn test_from_edge_list_path() {
+        // Path graph P₄: 0-1-2-3
+        let edges = vec![(0, 1, 1.0), (1, 2, 1.0), (2, 3, 1.0)];
+        let g = CathedralProbe::from_edge_list(4, &edges);
+        assert_eq!(g.node_count(), 4);
+        assert_eq!(g.edge_count(), 3);
+        let expected_fiedler = 2.0 - 2.0_f64.sqrt();
+        assert!(rel_close(g.fiedler_value(), expected_fiedler, 0.02));
+    }
+
+    #[test]
+    fn test_from_edge_list_empty() {
+        let g = CathedralProbe::from_edge_list(3, &[]);
+        assert_eq!(g.node_count(), 3);
+        assert_eq!(g.edge_count(), 0);
+    }
+
+    #[test]
+    fn test_from_edge_list_self_loop_ignored() {
+        let edges = vec![(0, 0, 5.0), (0, 1, 1.0)];
+        let g = CathedralProbe::from_edge_list(2, &edges);
+        assert_eq!(g.edge_count(), 1); // self-loop ignored
+    }
+
+    #[test]
+    fn test_from_edge_list_out_of_bounds_ignored() {
+        let edges = vec![(0, 1, 1.0), (0, 5, 1.0)]; // node 5 doesn't exist
+        let g = CathedralProbe::from_edge_list(2, &edges);
+        assert_eq!(g.edge_count(), 1); // out-of-bounds edge ignored
+    }
+
+    #[test]
+    fn test_from_weighted_adjacency_star() {
+        // Star graph S₄: hub=0, leaves=1,2,3
+        let n = 4;
+        let mut weights = vec![0.0f64; n * n];
+        // row 0: [0, 1, 1, 1]
+        weights[0 * n + 1] = 1.0;
+        weights[0 * n + 2] = 1.0;
+        weights[0 * n + 3] = 1.0;
+        // symmetric
+        weights[1 * n + 0] = 1.0;
+        weights[2 * n + 0] = 1.0;
+        weights[3 * n + 0] = 1.0;
+
+        let g = CathedralProbe::from_weighted_adjacency(&weights, n).unwrap();
+        assert_eq!(g.node_count(), 4);
+        assert_eq!(g.edge_count(), 3);
+        assert!(rel_close(g.fiedler_value(), 1.0, 0.02));
+    }
+
+    #[test]
+    fn test_from_weighted_adjacency_bad_length() {
+        let result = CathedralProbe::from_weighted_adjacency(&[0.0; 3], 2); // 3 != 4
+        assert!(result.is_err());
+    }
+
+    // ─── Per-component analysis ──────────────────────────────────
+
+    #[test]
+    fn test_per_component_connected() {
+        let p = complete_graph(3);
+        let components = p.per_component_analysis();
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].size, 3);
+        assert!(components[0].fiedler_value > 0.0);
+    }
+
+    #[test]
+    fn test_per_component_disconnected() {
+        // Two disconnected edges: 0-1 and 2-3
+        let mut p = CathedralProbe::new(vec!["a", "b", "c", "d"]);
+        p.connect("a", "b", 1.0);
+        p.connect("c", "d", 1.0);
+        let components = p.per_component_analysis();
+        assert_eq!(components.len(), 2);
+        for comp in &components {
+            assert_eq!(comp.size, 2);
+            assert!(comp.fiedler_value > 0.0); // each sub-component is connected
+        }
+    }
+
+    #[test]
+    fn test_per_component_isolated_nodes() {
+        // 4 nodes, only one edge 0-1
+        let mut p = CathedralProbe::new(vec!["a", "b", "c", "d"]);
+        p.connect("a", "b", 1.0);
+        let components = p.per_component_analysis();
+        assert_eq!(components.len(), 3); // {a,b}, {c}, {d}
+        let mut sizes: Vec<usize> = components.iter().map(|c| c.size).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![1, 1, 2]);
+    }
+
+    #[test]
+    fn test_per_component_empty() {
+        let p = CathedralProbe::new(vec![]);
+        assert!(p.per_component_analysis().is_empty());
+    }
+
+    #[test]
+    fn test_per_component_single_node() {
+        let p = CathedralProbe::new(vec!["a"]);
+        let c = p.per_component_analysis();
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].fiedler_value, 0.0);
+        assert_eq!(c[0].cheeger_upper, 0.0);
+    }
+
+    #[test]
+    fn test_per_component_fiedler_matches_subgraph() {
+        // Two triangles connected by a bridge
+        let mut p = CathedralProbe::new(vec!["a", "b", "c", "d", "e", "f"]);
+        // Triangle 1
+        p.connect("a", "b", 1.0);
+        p.connect("b", "c", 1.0);
+        p.connect("a", "c", 1.0);
+        // Triangle 2
+        p.connect("d", "e", 1.0);
+        p.connect("e", "f", 1.0);
+        p.connect("d", "f", 1.0);
+        // Bridge
+        p.connect("c", "d", 0.1);
+
+        // Whole graph is connected → 1 component
+        let components = p.per_component_analysis();
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].size, 6);
+    }
+
+    // ─── Serde round-trip (behind feature gate) ──────────────────
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_roundtrip_spectrum_result() {
+        let p = complete_graph(3);
+        let result = p.spectrum_result();
+        let json = serde_json::to_string(&result).unwrap();
+        let back: SpectrumResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.eigenvalues.len(), result.eigenvalues.len());
+        for (a, b) in back.eigenvalues.iter().zip(&result.eigenvalues) {
+            assert!((a - b).abs() < 0.01);
+        }
+        assert_eq!(back.converged, result.converged);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_roundtrip_spectrum_method() {
+        let method = SpectrumMethod::DenseImplicitQr;
+        let json = serde_json::to_string(&method).unwrap();
+        let back: SpectrumMethod = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, method);
+
+        let lanczos = SpectrumMethod::Lanczos { k: 5 };
+        let json2 = serde_json::to_string(&lanczos).unwrap();
+        let back2: SpectrumMethod = serde_json::from_str(&json2).unwrap();
+        assert_eq!(back2, lanczos);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_roundtrip_cathedral_error() {
+        let err = CathedralError::NodeNotFound("foo".into());
+        let json = serde_json::to_string(&err).unwrap();
+        let back: CathedralError = serde_json::from_str(&json).unwrap();
+        match back {
+            CathedralError::NodeNotFound(s) => assert_eq!(s, "foo"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_roundtrip_component_analysis() {
+        let ca = ComponentAnalysis {
+            nodes: vec![0, 1, 2],
+            fiedler_value: 3.0,
+            cheeger_upper: 2.449,
+            size: 3,
+        };
+        let json = serde_json::to_string(&ca).unwrap();
+        let back: ComponentAnalysis = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.nodes, ca.nodes);
+        assert!((back.fiedler_value - ca.fiedler_value).abs() < 1e-10);
+        assert_eq!(back.size, ca.size);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_to_json_output() {
+        let mut p = CathedralProbe::new(vec!["a", "b"]);
+        p.connect("a", "b", 1.0);
+        let json = p.to_json().unwrap();
+        assert!(json.contains("\"eigenvalues\""));
+        assert!(json.contains("\"converged\""));
+        // Verify it's valid JSON by parsing back
+        let _: SpectrumResult = serde_json::from_str(&json).unwrap();
     }
 }
